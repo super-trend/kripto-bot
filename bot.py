@@ -13,7 +13,7 @@ kaldirac = 2
 atr_esik = 25.0
 mola_suresi = 30
 mesafe_siniri = 0.006  
-ekleme_mesafesi = 0.003 
+ekleme_yaklasim = 0.03 # EMA'ya %3 yaklaşma şartı
 
 komisyon_orani = 0.0005 
 fonlama_orani = 0.0001  
@@ -51,14 +51,19 @@ while True:
         
         guncel_mum = df.iloc[-1]
         sinyal_mumu = df.iloc[-2] 
+        onceki_mum = df.iloc[-3]
         simdi = datetime.now(timezone.utc)
+        
+        # --- KESİŞİM VE SİNYAL KONTROLÜ ---
+        # Sadece SuperTrend yön değiştirdiğinde sinyal tetiklenir
+        yeni_kesisim = sinyal_mumu['st_yon'] != onceki_mum['st_yon']
         
         long_sinyal = sinyal_mumu['st_yon'] == 1 and sinyal_mumu['st_cizgi'] > sinyal_mumu['ema250']
         short_sinyal = sinyal_mumu['st_yon'] == -1 and sinyal_mumu['st_cizgi'] < sinyal_mumu['ema250']
         
-        # --- 3. İŞLEM KAPATMA ---
+        # --- 3. İŞLEM KAPATMA (TERS SİNYAL) ---
         if aktif_poz:
-            if simdi.hour in fonlama_saatleri and simdi.minute == 0 and simdi.second < 1:
+            if simdi.hour in fonlama_saatleri and simdi.minute == 0 and simdi.second < 2:
                 kasa -= (aktif_poz['tutar'] * kaldirac) * fonlama_orani
 
             if (aktif_poz['yon'] == "SHORT" and long_sinyal) or (aktif_poz['yon'] == "LONG" and short_sinyal):
@@ -69,56 +74,84 @@ while True:
                 islem_sayaci += 1
                 islem_gecmisi.append([islem_sayaci, aktif_poz['giris_saati'], aktif_poz['yon'], f"{aktif_poz['giris_fiyati']:,}", f"{fiyat:,}", f"{islem_sonucu:+.2f}", f"{kasa:.2f}"])
                 aktif_poz = None
+                son_islem_zamani = simdi
 
-        # --- 4. YENİ GİRİŞ ---
-        if aktif_poz is None:
+        # --- 4. YENİ GİRİŞ VE KADEME KONTROLÜ ---
+        if aktif_poz is None and yeni_kesisim:
             yon = "LONG" if long_sinyal else "SHORT" if short_sinyal else None
             if yon:
                 dak_fark = (simdi - son_islem_zamani).total_seconds() / 60
                 if sinyal_mumu['atr'] >= atr_esik and dak_fark >= mola_suresi:
                     mesafe = abs(sinyal_mumu['close'] - sinyal_mumu['ema250']) / sinyal_mumu['ema250']
-                    kademe = 2 if mesafe >= mesafe_siniri else 1
-                    # DEĞİŞİKLİK BURADA: Kademe ne olursa olsun kasanın tamamı kullanılır
-                    tutar = kasa 
-                    kasa -= (tutar + (tutar * kaldirac * komisyon_orani))
-                    aktif_poz = {
-                        'yon': yon, 'giris_fiyati': guncel_mum['open'], 'tutar': tutar, 'kademe': str(kademe),
-                        'giris_saati': simdi.strftime('%H:%M'), 'tp1': False, 'tp2': False, 'ema_ekle': (kademe == 1)
-                    }
-                    son_islem_zamani = simdi
+                    
+                    if mesafe >= mesafe_siniri:
+                        # %0.6'dan büyük: Yarım Kasa
+                        tutar = kasa / 2
+                        kasa -= (tutar + (tutar * kaldirac * komisyon_orani))
+                        aktif_poz = {
+                            'yon': yon, 'giris_fiyati': guncel_mum['open'], 'tutar': tutar, 
+                            'kasa_durum': 'Yarım', 'hedef_ema': sinyal_mumu['ema250'],
+                            'giris_saati': simdi.strftime('%H:%M'), 'tp_sayac': 0
+                        }
+                    else:
+                        # %0.6'dan küçük: Tam Kasa
+                        tutar = kasa
+                        kasa -= (tutar + (tutar * kaldirac * komisyon_orani))
+                        aktif_poz = {
+                            'yon': yon, 'giris_fiyati': guncel_mum['open'], 'tutar': tutar, 
+                            'kasa_durum': 'Tam', 'hedef_ema': None,
+                            'giris_saati': simdi.strftime('%H:%M'), 'tp_sayac': 0
+                        }
 
-        # --- 5. POZİSYON YÖNETİMİ VE PNL ---
-        pnl_yuzde, pnl_usdt, tp_fiyat, mum_fiyat = 0.0, 0.0, 0.0, 0.0
+        # --- 5. KASA TAMAMLAMA (KADEMELİ ALIM) ---
+        if aktif_poz and aktif_poz['kasa_durum'] == 'Yarım':
+            fiyat = guncel_mum['close']
+            ema_hedef = aktif_poz['hedef_ema']
+            yaklasim = abs(fiyat - ema_hedef) / ema_hedef
+            if yaklasim <= ekleme_yaklasim:
+                ek_tutar = kasa 
+                kasa -= (ek_tutar + (ek_tutar * kaldirac * komisyon_orani))
+                aktif_poz['tutar'] += ek_tutar
+                aktif_poz['kasa_durum'] = 'Tam (Tamamlandı)'
+
+        # --- 6. KAR AL (TP) YÖNETİMİ ---
+        pnl_yuzde, pnl_usdt = 0.0, 0.0
         if aktif_poz:
             fiyat = guncel_mum['close']
             pnl_yuzde = ((fiyat - aktif_poz['giris_fiyati']) / aktif_poz['giris_fiyati'] if aktif_poz['yon'] == "LONG" else (aktif_poz['giris_fiyati'] - fiyat) / aktif_poz['giris_fiyati']) * 100
             pnl_usdt = (aktif_poz['tutar'] * (pnl_yuzde / 100) * kaldirac)
-            
-            # Beklenen Fiyatlar (Görsel Panel İçin)
-            tp_fiyat = aktif_poz['giris_fiyati'] * (1.02 if aktif_poz['yon'] == "LONG" else 0.98)
-            mum_fiyat = guncel_mum['open'] * (1.01 if aktif_poz['yon'] == "LONG" else 0.99)
 
-            # Kar Al / Sıçrama Kontrolü
-            mum_boy = abs(guncel_mum['close'] - guncel_mum['open']) / guncel_mum['open']
-            if (pnl_yuzde >= 2.0 and not aktif_poz['tp1']) or (mum_boy >= 0.01 and pnl_yuzde > 0 and not aktif_poz['tp2']):
+            # %1 Mum Sıçraması (Lehimize)
+            mum_boy = (guncel_mum['close'] - guncel_mum['open']) / guncel_mum['open']
+            sıcrama = (mum_boy >= 0.01 if aktif_poz['yon'] == "LONG" else mum_boy <= -0.01)
+            
+            # TP Hiyerarşisi
+            if (pnl_yuzde >= 2.0 or (sıcrama and pnl_yuzde > 0)):
                 k_tutar = aktif_poz['tutar'] / 2
                 kasa += k_tutar + (k_tutar * (pnl_yuzde/100) * kaldirac) - (k_tutar * kaldirac * komisyon_orani)
                 aktif_poz['tutar'] /= 2
-                if pnl_yuzde >= 2.0: aktif_poz['tp1'] = True
-                else: aktif_poz['tp2'] = True
+                aktif_poz['tp_sayac'] += 1
 
-        # --- 6. ÖZEL GÖZLEM PANELİ ---
+        # --- 7. ÖZEL GÖZLEM PANELİ ---
+        # ANSI kaçış dizisi ile ekranın her saniye en başa sarılarak temizlenmesi
+        print("\033[H\033[J", end="") 
+        
         print("-" * 75)
         print(f"{symbol}   ATR: {guncel_mum['atr']:.2f}               SAAT: {simdi.strftime('%H:%M:%S')} UTC")
         print("-" * 75)
         print(f"KASA (Nakit)           {kasa:.2f} USDT")
         print(f"DURUM                  {aktif_poz['yon'] if aktif_poz else 'SİNYAL BEKLENİYOR'}")
-        print(f"İşleme Giriş Fiyatı    {aktif_poz['giris_fiyati'] if aktif_poz else '-'}")
-        print(f"Güncel Fiyat           {guncel_mum['close']:,}")
-        print(f"İşlem Tutarı           {aktif_poz['kademe'] + '. Kademe (' + str(round(aktif_poz['tutar'],2)) + ' USDT)' if aktif_poz else '-'}")
-        print(f"KISMİ KAR              {'%50 için ' + str(round(tp_fiyat,1)) + ' bekleniyor' if aktif_poz and not aktif_poz['tp1'] else 'ALINDI' if aktif_poz else '-'}")
-        print(f"TEK MUM ŞARTI          {'%1 mum (' + str(round(mum_fiyat,1)) + ') gelirse kapanacak' if aktif_poz and not aktif_poz['tp2'] else 'TETİKLENDİ' if aktif_poz else '-'}")
-        print(f"PNL                    (% {pnl_yuzde:+.2f})   {pnl_usdt:+.2f} USDT")
+        
+        if aktif_poz:
+            print(f"Pozisyon Büyüklüğü     {aktif_poz['kasa_durum']} Kasa ({round(aktif_poz['tutar'], 2)} USDT)")
+            if aktif_poz['kasa_durum'] == 'Yarım':
+                print(f"Kademeli Alış          {round(aktif_poz['hedef_ema'], 2)} Bekleniyor")
+            elif 'Tamamlandı' in aktif_poz['kasa_durum']:
+                print(f"Kademeli Alış          GERÇEKLEŞTİ")
+            
+            print(f"İşleme Giriş Fiyatı    {aktif_poz['giris_fiyati']}")
+            print(f"Güncel PNL             % {pnl_yuzde:+.2f} ({pnl_usdt:+.2f} USDT)")
+            print(f"Kar Al (TP) Durumu     {aktif_poz['tp_sayac']} kez yarım kapatıldı")
         
         print(f"\n{'='*75}\n BİTEN İŞLEMLER (GEÇMİŞ)\n{'='*75}")
         print(tabulate(islem_gecmisi, headers=["NO", "GİRİŞ", "YÖN", "G.FİYAT", "Ç.FİYAT", "P/L (NET)", "KASA"], tablefmt="grid"))
